@@ -1,0 +1,96 @@
+# Publishes resium to npm with provenance via npm Trusted Publishing (OIDC).
+#
+# Prerequisites (one-time setup, do these BEFORE the first tag push):
+#   1. On npmjs.com: Settings → Trusted publishers → add this repo
+#      (reearth/resium) and this workflow filename (publish.yml). This tells
+#      npm to accept OIDC tokens minted by this exact workflow instead of an
+#      NPM_TOKEN secret.
+#   2. On GitHub: Settings → Environments → create `npm-publish` with required
+#      reviewers. The publish step pauses for manual approval, so a compromised
+#      tag push can't auto-publish.
+#
+# Release flow:
+#   1. Run the `Prepare Release` workflow (release.yml) to open a release PR.
+#   2. Merge the PR. The `Tag Release` workflow (tag.yml) then auto-pushes the
+#      matching tag (e.g. `v1.22.0`), which fires this workflow.
+#   3. Approve the `npm-publish` environment in the run page.
+#   4. npm receives the package with a provenance attestation; anyone can
+#      verify with `npm audit signatures`.
+#
+# Dist-tag selection:
+#   Stable tags like `v1.22.0` publish to the default `latest` dist-tag —
+#   `npm install resium` picks them up automatically.
+#   Pre-release tags like `v1.22.0-rc.0` or `v2.0.0-beta.1` (anything with a
+#   hyphen) publish to the `next` dist-tag instead, so they don't replace
+#   `latest`. Users opt in via `npm install resium@next`.
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: npm publish
+    runs-on: ubuntu-latest
+    environment: npm-publish # gates publish on required reviewer approval
+    permissions:
+      contents: read
+      id-token: write # for npm provenance and trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # Node version is pinned in .node-version (shared by all workflows).
+          # npm Trusted Publishing requires Node >=22.14 and npm >=11.5.1.
+          # Node 24 bundles npm 11.x, so the bundled npm is used as-is.
+          node-version-file: ".node-version"
+          registry-url: "https://registry.npmjs.org"
+          cache: "npm"
+      - name: Check npm supports Trusted Publishing
+        # Fail fast with a clear message if .node-version ever moves to a Node
+        # release whose bundled npm predates Trusted Publishing (Node 22 ships
+        # npm 10.x), rather than failing later at `npm publish`.
+        run: |
+          npm --version
+          node -e '
+            const v = process.argv[1].split(".").map(n => parseInt(n, 10));
+            const min = [11, 5, 1];
+            const cmp = v[0] - min[0] || v[1] - min[1] || v[2] - min[2];
+            if (cmp < 0) {
+              console.error(`::error::npm ${process.argv[1]} is older than 11.5.1, the minimum for Trusted Publishing`);
+              process.exit(1);
+            }
+          ' "$(npm --version)"
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify tag matches package.json version
+        # The release PR already bumped package.json. We just sanity-check
+        # that the pushed tag matches, then publish — no version mutation
+        # here, so the npm tarball is exactly what merged to main.
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (=> $TAG_VERSION) does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "Publishing version $PKG_VERSION"
+      - name: Build
+        run: npm run build
+      - name: Publish to npm with provenance
+        # Pre-release tags (vX.Y.Z-foo) go to the `next` dist-tag so they
+        # don't replace `latest`. Stable tags (vX.Y.Z) go to `latest`.
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            echo "Pre-release detected; publishing to dist-tag 'next'"
+            npm publish --provenance --access public --tag next
+          else
+            echo "Stable release; publishing to dist-tag 'latest'"
+            npm publish --provenance --access public
+          fi
